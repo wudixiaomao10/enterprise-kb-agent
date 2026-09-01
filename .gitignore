@@ -1,0 +1,20 @@
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets: keep only the placeholder example
+.env
+.env.*
+!.env.example
+
+# Local caches, logs, and editor config
+.rag/
+.codex-logs/
+.codex-tmp/
+.pytest_cache/
+.claude/
+
+# Frontend dependencies (restore with npm install)
+node_modules/

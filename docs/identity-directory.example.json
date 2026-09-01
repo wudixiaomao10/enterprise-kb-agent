@@ -1,0 +1,43 @@
+{
+  "source": "enterprise-idp",
+  "deactivate_missing": true,
+  "users": [
+    {
+      "external_id": "idp-user-001",
+      "user_id": "u_alice",
+      "subject": "oidc-subject-001",
+      "issuer": "https://login.example.com/tenant/v2.0",
+      "email": "alice@example.com",
+      "display_name": "Alice",
+      "active": true
+    }
+  ],
+  "departments": [
+    {
+      "external_id": "idp-group-sales",
+      "unit_id": "sales",
+      "name": "Sales",
+      "active": true
+    }
+  ],
+  "roles": [
+    {
+      "external_id": "idp-role-admin",
+      "unit_id": "admin",
+      "name": "Knowledge Administrator",
+      "active": true
+    }
+  ],
+  "user_departments": [
+    {
+      "user_external_id": "idp-user-001",
+      "unit_external_id": "idp-group-sales"
+    }
+  ],
+  "user_roles": [
+    {
+      "user_external_id": "idp-user-001",
+      "unit_external_id": "idp-role-admin"
+    }
+  ]
+}

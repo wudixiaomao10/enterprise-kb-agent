@@ -1,0 +1,27 @@
+[
+  {
+    "id": "product_capabilities_sales",
+    "question": "企业知识库支持什么能力？",
+    "user_id": "u_sales",
+    "department_ids": ["sales"],
+    "expected_document_titles": ["产品资料手册"],
+    "k": 5
+  },
+  {
+    "id": "hr_policy_sales_refusal",
+    "question": "年假制度是什么？",
+    "user_id": "u_sales",
+    "department_ids": ["sales"],
+    "expected_document_titles": [],
+    "should_refuse": true,
+    "k": 5
+  },
+  {
+    "id": "hr_policy_hr",
+    "question": "员工入职满一年后有什么制度？",
+    "user_id": "u_hr",
+    "department_ids": ["hr"],
+    "expected_document_titles": ["员工制度"],
+    "k": 5
+  }
+]

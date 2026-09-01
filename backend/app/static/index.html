@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>企业知识库 Research Agent</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=20260831-3">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><i data-lucide="library-big"></i></div>
+        <div>
+          <strong>企业知识库</strong>
+          <span>Research Agent</span>
+        </div>
+      </div>
+
+      <nav class="primary-nav" aria-label="主导航">
+        <button class="nav-item is-active" data-view="research" type="button">
+          <i data-lucide="messages-square"></i><span>知识问答</span>
+        </button>
+        <button class="nav-item" data-view="documents" type="button">
+          <i data-lucide="files"></i><span>文档库</span><span class="nav-count" id="navDocumentCount">0</span>
+        </button>
+        <button class="nav-item" data-view="upload" type="button">
+          <i data-lucide="file-up"></i><span>上传索引</span>
+        </button>
+        <button class="nav-item" data-view="jobs" type="button">
+          <i data-lucide="list-checks"></i><span>索引任务</span><span class="nav-count" id="navJobCount">0</span>
+        </button>
+        <button class="nav-item" data-view="system" type="button">
+          <i data-lucide="activity"></i><span>系统状态</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="session-summary">
+          <div class="avatar" id="sidebarAvatar">S</div>
+          <div class="session-copy">
+            <strong id="sidebarUser">正在连接</strong>
+            <span id="sidebarScope">本地身份目录</span>
+          </div>
+          <span class="presence-dot" id="presenceDot" title="连接状态"></span>
+        </div>
+      </div>
+    </aside>
+
+    <div class="main-shell">
+      <header class="topbar">
+        <div class="topbar-leading">
+          <button class="icon-button mobile-menu" id="mobileMenu" type="button" aria-label="打开导航" title="打开导航">
+            <i data-lucide="menu"></i>
+          </button>
+          <div class="breadcrumb">
+            <span>工作台</span><i data-lucide="chevron-right"></i><strong id="currentViewName">知识问答</strong>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div class="service-state" id="serviceState"><span></span>服务检查中</div>
+          <a class="icon-button" href="/docs" target="_blank" rel="noreferrer" aria-label="打开 API 文档" title="API 文档">
+            <i data-lucide="braces"></i>
+          </a>
+          <button class="identity-button" id="identityButton" type="button" aria-expanded="false">
+            <span class="avatar avatar-small" id="topbarAvatar">S</span>
+            <span class="identity-label"><strong id="topbarUser">u_sales</strong><small id="topbarDepartment">sales</small></span>
+            <i data-lucide="chevron-down"></i>
+          </button>
+        </div>
+        <div class="identity-popover" id="identityPopover" hidden>
+          <div id="oidcAuthPanel" hidden>
+            <div class="popover-heading">
+              <strong>Microsoft Entra ID</strong>
+              <span>权限取自企业身份目录</span>
+            </div>
+            <div class="signed-in-summary" id="oidcSignedIn" hidden>
+              <span class="avatar" id="oidcAvatar">E</span>
+              <div><strong id="oidcUserName">企业用户</strong><span id="oidcUserEmail"></span></div>
+            </div>
+            <button class="button button-primary button-full" id="oidcLoginBtn" type="button">
+              <i data-lucide="log-in"></i><span>使用 Entra ID 登录</span>
+            </button>
+            <button class="button button-secondary button-full" id="logoutBtn" type="button" hidden>
+              <i data-lucide="log-out"></i><span>退出登录</span>
+            </button>
+            <p class="form-note" id="oidcAuthStatus">等待企业身份认证</p>
+          </div>
+          <div id="devAuthPanel">
+            <div class="popover-heading">
+              <strong>开发身份</strong>
+              <span>权限取自 PostgreSQL 目录</span>
+            </div>
+            <label for="userId">用户</label>
+            <select id="userId">
+              <option value="u_sales">销售用户</option>
+              <option value="u_hr">HR 用户</option>
+              <option value="u_finance">财务用户</option>
+              <option value="u_admin">系统管理员</option>
+            </select>
+            <label for="department">请求部门</label>
+            <select id="department">
+              <option value="sales">sales</option>
+              <option value="hr">hr</option>
+              <option value="finance">finance</option>
+              <option value="platform">platform</option>
+            </select>
+            <button class="button button-primary button-full" id="loginBtn" type="button">
+              <i data-lucide="log-in"></i><span>切换身份</span>
+            </button>
+            <p class="form-note" id="authStatus">正在获取本地开发令牌</p>
+          </div>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="view is-active" id="view-research" data-view-panel="research">
+          <div class="view-header">
+            <div>
+              <h1>知识问答</h1>
+              <p><span id="researchDocumentCount">0</span> 份可访问文档 · <span id="researchScope">sales</span></p>
+            </div>
+            <button class="button button-secondary" id="newResearchBtn" type="button">
+              <i data-lucide="plus"></i><span>新对话</span>
+            </button>
+          </div>
+
+          <div class="research-workspace">
+            <div class="research-main">
+              <div class="conversation" id="conversation" aria-live="polite">
+                <div class="empty-state" id="conversationEmpty">
+                  <div class="empty-icon"><i data-lucide="scan-search"></i></div>
+                  <h2>从知识库开始提问</h2>
+                  <div class="prompt-grid">
+                    <button class="prompt-option" type="button">企业知识库支持哪些能力？<i data-lucide="arrow-up-right"></i></button>
+                    <button class="prompt-option" type="button">产品资料中的引用策略是什么？<i data-lucide="arrow-up-right"></i></button>
+                    <button class="prompt-option" type="button">总结当前可访问的公司制度<i data-lucide="arrow-up-right"></i></button>
+                  </div>
+                </div>
+              </div>
+              <div class="composer-wrap">
+                <div class="composer">
+                  <textarea id="question" rows="2" placeholder="向企业知识库提问" aria-label="问题"></textarea>
+                  <div class="composer-footer">
+                    <div class="composer-options">
+                      <div class="query-mode" role="group" aria-label="回答模式">
+                        <button class="is-active" data-query-mode="quick" type="button">快速</button>
+                        <button data-query-mode="deep" type="button">深度研究</button>
+                      </div>
+                      <label for="resultLimit">证据</label>
+                      <select id="resultLimit" aria-label="检索数量">
+                        <option value="3">3 条</option>
+                        <option value="5" selected>5 条</option>
+                        <option value="8">8 条</option>
+                      </select>
+                    </div>
+                    <button class="send-button" id="queryBtn" type="button" aria-label="发送问题" title="发送">
+                      <i data-lucide="arrow-up"></i>
+                    </button>
+                  </div>
+                </div>
+                <p class="composer-note" id="composerNote">回答仅使用当前身份可访问的证据</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-documents" data-view-panel="documents" hidden>
+          <div class="view-header">
+            <div>
+              <h1>文档库</h1>
+              <p>当前身份可访问的知识资产</p>
+            </div>
+            <button class="button button-primary" data-open-view="upload" type="button">
+              <i data-lucide="file-up"></i><span>上传文档</span>
+            </button>
+          </div>
+          <div class="toolbar">
+            <div class="search-field">
+              <i data-lucide="search"></i>
+              <input id="documentSearch" type="search" placeholder="搜索标题、类型或部门" aria-label="搜索文档">
+            </div>
+            <button class="icon-button" id="refreshDocuments" type="button" aria-label="刷新文档" title="刷新">
+              <i data-lucide="refresh-cw"></i>
+            </button>
+          </div>
+          <div class="table-surface">
+            <div class="table-header document-grid">
+              <span>文档</span><span>类型</span><span>归属部门</span><span>所有者</span><span></span>
+            </div>
+            <div id="documents" class="table-body"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-upload" data-view-panel="upload" hidden>
+          <div class="view-header">
+            <div>
+              <h1>上传索引</h1>
+              <p>PDF、Word 与 Markdown</p>
+            </div>
+          </div>
+          <div class="upload-surface">
+            <div class="upload-source">
+              <div class="segmented" role="tablist" aria-label="上传方式">
+                <button class="is-active" data-upload-mode="file" role="tab" type="button">选择文件</button>
+                <button data-upload-mode="text" role="tab" type="button">粘贴文本</button>
+              </div>
+              <div id="fileMode">
+                <label class="dropzone" for="fileInput" id="dropzone">
+                  <input id="fileInput" type="file" accept=".pdf,.docx,.md,.txt" hidden>
+                  <span class="dropzone-icon"><i data-lucide="upload-cloud"></i></span>
+                  <strong id="fileLabel">选择或拖入文档</strong>
+                  <span>PDF、DOCX、MD、TXT · 最大 100 MB</span>
+                </label>
+              </div>
+              <div id="textMode" hidden>
+                <label for="content">文档内容</label>
+                <textarea id="content" rows="12" placeholder="# 文档标题&#10;&#10;在此粘贴 Markdown 或纯文本内容"></textarea>
+              </div>
+            </div>
+            <div class="upload-meta">
+              <h2>文档信息</h2>
+              <label for="title">标题</label>
+              <input id="title" value="报销制度">
+              <label for="filename">文件名</label>
+              <input id="filename" value="policy.md">
+              <label for="uploadDepartment">归属部门</label>
+              <select id="uploadDepartment">
+                <option value="sales">sales</option>
+                <option value="hr">hr</option>
+                <option value="finance">finance</option>
+                <option value="platform">platform</option>
+              </select>
+              <div class="permission-row">
+                <i data-lucide="shield-check"></i>
+                <div><strong>权限隔离</strong><span id="permissionHint">仅 sales 部门可检索</span></div>
+              </div>
+              <button class="button button-primary button-full" id="uploadBtn" type="button">
+                <i data-lucide="sparkles"></i><span>上传并建立索引</span>
+              </button>
+              <div class="job-progress" id="uploadProgress" hidden>
+                <div><strong id="uploadStatus">正在提交</strong><span id="uploadPercent">0%</span></div>
+                <div class="progress-track"><span id="uploadProgressBar"></span></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-jobs" data-view-panel="jobs" hidden>
+          <div class="view-header">
+            <div>
+              <h1>索引任务</h1>
+              <p>文档解析与向量化进度</p>
+            </div>
+            <button class="icon-button" id="refreshJobs" type="button" aria-label="刷新任务" title="刷新">
+              <i data-lucide="refresh-cw"></i>
+            </button>
+          </div>
+          <div class="table-surface">
+            <div class="table-header job-grid">
+              <span>任务</span><span>状态</span><span>进度</span><span>更新时间</span><span></span>
+            </div>
+            <div id="jobs" class="table-body"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-system" data-view-panel="system" hidden>
+          <div class="view-header">
+            <div>
+              <h1>系统状态</h1>
+              <p>检索、模型与基础设施</p>
+            </div>
+            <button class="button button-secondary" id="refreshSystem" type="button">
+              <i data-lucide="refresh-cw"></i><span>刷新状态</span>
+            </button>
+          </div>
+          <div class="status-overview">
+            <div class="status-summary">
+              <span class="status-symbol is-ok"><i data-lucide="check"></i></span>
+              <div><strong id="systemHeadline">服务运行正常</strong><span id="systemTimestamp">刚刚检查</span></div>
+            </div>
+            <div class="metric-strip">
+              <div><span>文档</span><strong id="metricDocuments">0</strong></div>
+              <div><span>运行任务</span><strong id="metricJobs">0</strong></div>
+              <div><span>身份目录</span><strong id="metricIdentity">连接</strong></div>
+            </div>
+          </div>
+          <div class="status-list" id="pipelineStatus">
+            <div class="status-row skeleton-row"></div>
+            <div class="status-row skeleton-row"></div>
+            <div class="status-row skeleton-row"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="detail-scrim" id="detailScrim" hidden></div>
+  <aside class="detail-drawer" id="detailDrawer" aria-hidden="true" aria-labelledby="detailTitle">
+    <header class="detail-header">
+      <div>
+        <span id="detailEyebrow">文档详情</span>
+        <h2 id="detailTitle">详情</h2>
+      </div>
+      <button class="icon-button" id="detailClose" type="button" aria-label="关闭详情" title="关闭">
+        <i data-lucide="x"></i>
+      </button>
+    </header>
+    <div class="detail-body" id="detailBody"></div>
+  </aside>
+
+  <div class="mobile-scrim" id="mobileScrim" hidden></div>
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+
+  <script src="/assets/app.bundle.js?v=20260831-3" defer></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "enterprise-kb-agent-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild backend/app/static/app.js --bundle --format=iife --platform=browser --target=es2022 --minify --outfile=backend/app/static/app.bundle.js",
+    "test": "node tests/js/auth.test.js"
+  },
+  "dependencies": {
+    "@azure/msal-browser": "5.17.3",
+    "lucide": "0.468.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9"
+  }
+}
