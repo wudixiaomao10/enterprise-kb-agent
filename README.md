@@ -4,7 +4,7 @@
 
 它不是把文档整篇丢给大模型。浏览器登录后，后端用服务端身份目录决定「当前用户能看哪些资料」，在这个范围内做关键词 + 向量混合检索，生成结构化结论，再用 Citation Binder 和 Evidence Verifier 核对引用是否真实、是否仍有效、是否属于该用户权限。证据不足或无权访问时，系统会明确拒答，而不是编造内容。
 
-完整实现说明见 [`docs/企业知识库Agent一步步实现.md`](docs/企业知识库Agent一步步实现.md)。
+完整实现说明见 [`docs/企业知识库Agent详细讲解.md`](docs/企业知识库Agent详细讲解.md)。
 
 ## 解决什么问题
 
@@ -46,7 +46,7 @@ plan -> retrieve -> assess -> expand/retrieve -> synthesize
 
 每一轮检索都带上当前用户的 ACL。最终输出复用与快速问答相同的引用绑定和证据验证。客户端轮询 `GET /research/jobs/{job_id}`。
 
-文档进入知识库的路径是：上传 → 安全检查 → 对象存储 → 解析/OCR → 切块 → Embedding → 索引。身份同步走 Microsoft Graph 增量或 SCIM；运维侧用 Redis 作队列传输、PostgreSQL 存任务与 DLQ。
+文档进入知识库的路径是：上传 → 安全检查 → 对象存储 → 解析/OCR → 切块 → Embedding → 索引。身份同步可走飞书通讯录、Microsoft Graph 增量或 SCIM；运维侧用 Redis 作队列传输、PostgreSQL 存任务与 DLQ。
 
 ## 技术栈
 
@@ -68,7 +68,7 @@ backend/app/retrieval      Embedding、混合检索、重排
 backend/app/security       登录、ACL、上传安全
 backend/app/agent          Claims、Citation Binder、Evidence Verifier
 backend/app/research       LangGraph 多轮研究
-backend/app/identity       身份目录、Graph、SCIM
+backend/app/identity       身份目录、飞书、Graph、SCIM
 backend/app/jobs           异步任务、重试、DLQ
 backend/app/repositories   Memory / SQLite / PostgreSQL
 backend/app/storage        本地或 S3/MinIO 对象存储
@@ -143,6 +143,7 @@ npm run build
 | 当前用户 | `GET /auth/me` |
 | 本地开发 Token | `POST /auth/dev-token` |
 | 身份目录 | `GET /admin/directory`，`POST /admin/directory/sync` |
+| 飞书同步与 Webhook | `POST /admin/directory/feishu/sync`，`POST /webhooks/feishu` |
 | Graph 同步与 Webhook | `POST /admin/directory/graph/sync`，`POST /webhooks/microsoft-graph` |
 | SCIM 2.0 | `http://127.0.0.1:8010/scim/v2`（使用 `KNOWLEDGE_SCIM_TOKEN`） |
 | 死信队列 | `GET /admin/jobs/dead-letter`，replay / discard |
@@ -154,6 +155,20 @@ npm run build
 python scripts/sync_identity_directory.py docs/identity-directory.example.json --dry-run
 python scripts/sync_identity_directory.py docs/identity-directory.example.json
 ```
+
+### 飞书通讯录身份源
+
+飞书以新增 Provider 的方式接入，不会替换现有 Entra OIDC、Microsoft Graph 或 SCIM。飞书管理后台需要创建企业自建应用，授予通讯录用户/部门只读权限，并订阅 `contact.user.*_v3`、`contact.department.*_v3` 和 `contact.scope.updated_v3` 事件。
+
+在 `.env.knowledge` 中填写 `.env.example` 的 `KNOWLEDGE_FEISHU_*` 参数后，执行首次全量同步：
+
+```powershell
+D:\Anaconda\envs\enterprise-kb-agent\python.exe scripts/sync_feishu_directory.py
+```
+
+`KNOWLEDGE_FEISHU_DEPARTMENT_ID_MAP` 把飞书 `open_department_id` 映射到文档 ACL 使用的稳定部门 ID。同步时会把用户的直接部门展开为完整祖先链，因此授权给上级部门的资料也对其子部门成员生效；无部门用户不会获得部门权限。
+
+事件回调地址为 `https://你的域名/webhooks/feishu`。生产环境应设置 `KNOWLEDGE_JOB_MODE=dramatiq`，由 Webhook 验证 Verification Token、签名、时间窗口并解密 AES 消息后入队；另用 cron 或计划任务定时运行上述全量同步命令作为兜底。身份目录模式要求登录 Token 的 `issuer + subject` 与同步结果一致，默认 subject 是飞书 `open_id`。
 
 ## 测试与评测
 
@@ -174,3 +189,5 @@ python scripts/pipeline_smoke_test.py
 - 更换向量维度时先停 API，再运行 `python scripts/migrate_embedding_dimensions.py --confirm-clear-vectors`。
 
 Graph 订阅需要可公网访问的 HTTPS Webhook，并定期执行 `python scripts/maintain_graph_subscriptions.py`。Nginx 示例在 `deploy/nginx/`。
+
+飞书事件订阅同样需要公网 HTTPS。Nginx 示例已经放行精确路径 `/webhooks/feishu`；正式启用前应先完成域名备案、证书配置、飞书应用发布与通讯录权限审批。

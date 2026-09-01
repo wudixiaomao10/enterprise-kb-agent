@@ -56,6 +56,28 @@ def process_graph_directory_sync(resources: list[str] | None = None) -> None:
     max_backoff=5 * 60_000,
     time_limit=30 * 60 * 1000,
 )
+def process_feishu_directory_sync(
+    user_id: str | None = None,
+    force_inactive: bool = False,
+    event_id: str | None = None,
+) -> None:
+    from backend.app.bootstrap import create_worker_feishu_sync_service
+
+    service = create_worker_feishu_sync_service()
+    service.sync(
+        user_id,
+        force_inactive=force_inactive,
+        event_id=event_id,
+    )
+
+
+@dramatiq.actor(
+    queue_name="identity-sync",
+    max_retries=5,
+    min_backoff=10_000,
+    max_backoff=5 * 60_000,
+    time_limit=30 * 60 * 1000,
+)
 def process_graph_subscription_maintenance() -> None:
     from backend.app.bootstrap import create_worker_graph_sync_service
 

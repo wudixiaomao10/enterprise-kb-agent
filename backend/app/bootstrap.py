@@ -16,6 +16,7 @@ from backend.app.identity.directory import (
     InMemoryIdentityDirectory,
     PostgresIdentityDirectory,
 )
+from backend.app.identity.feishu import FeishuConfig, FeishuSyncService
 from backend.app.identity.microsoft_graph import (
     MicrosoftGraphConfig,
     MicrosoftGraphSyncService,
@@ -217,6 +218,17 @@ def create_microsoft_graph_sync_service(
     )
 
 
+def create_feishu_sync_service(
+    directory: IdentityDirectory,
+    provisioning_store: PostgresIdentityProvisioningStore | None,
+) -> FeishuSyncService:
+    return FeishuSyncService(
+        FeishuConfig.from_env(),
+        directory,
+        provisioning_store=provisioning_store,
+    )
+
+
 def seed_local_identity_directory(directory: IdentityDirectory) -> None:
     issuer = os.getenv("KNOWLEDGE_JWT_ISSUER", "enterprise-kb-agent")
     if directory.resolve_user(issuer, "u_admin") is not None:
@@ -295,6 +307,14 @@ def create_worker_graph_sync_service() -> MicrosoftGraphSyncService:
     if service is None:
         raise RuntimeError("Microsoft Graph provisioning requires PostgreSQL")
     return service
+
+
+def create_worker_feishu_sync_service() -> FeishuSyncService:
+    embedding_provider = create_embedding_provider()
+    store = create_store(embedding_provider)
+    directory = create_identity_directory(store)
+    provisioning_store = create_identity_provisioning_store(store)
+    return create_feishu_sync_service(directory, provisioning_store)
 
 
 def create_worker_research_job_service() -> ResearchJobService:

@@ -23,7 +23,7 @@ try:
         UploadFile,
         status,
     )
-    from fastapi.responses import HTMLResponse, PlainTextResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, ConfigDict, Field
 except ImportError as error:  # pragma: no cover
@@ -32,6 +32,7 @@ except ImportError as error:  # pragma: no cover
 from backend.app.bootstrap import (
     create_demo_services,
     create_dead_letter_queue,
+    create_feishu_sync_service,
     create_identity_directory,
     create_identity_provisioning_store,
     create_index_job_service,
@@ -45,6 +46,7 @@ from backend.app.identity.directory import (
     DirectoryUnit,
     DirectoryUser,
 )
+from backend.app.identity.feishu import FeishuWebhookError
 from backend.app.identity.microsoft_graph import (
     GRAPH_RESOURCES,
     normalize_graph_resources,
@@ -112,6 +114,10 @@ research_job_service = create_research_job_service(
 )
 identity_provisioning_store = create_identity_provisioning_store(store)
 graph_sync_service = create_microsoft_graph_sync_service(identity_provisioning_store)
+feishu_sync_service = create_feishu_sync_service(
+    identity_directory,
+    identity_provisioning_store,
+)
 configure_authenticator(JWTAuthenticator(identity_directory))
 authenticator = get_authenticator()
 frontend_security_headers = browser_security_headers(
@@ -266,6 +272,12 @@ class GraphResourceRequest(BaseModel):
 
     resources: list[str] = Field(default_factory=lambda: list(GRAPH_RESOURCES))
     reset_cursor: bool = False
+
+
+class FeishuSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str | None = Field(default=None, max_length=256)
 
 
 @app.get("/health")
@@ -491,6 +503,71 @@ def sync_directory(
     }
 
 
+@app.get("/admin/directory/feishu")
+def feishu_directory_status(
+    _: AuthenticatedUser = Depends(require_admin),
+) -> dict[str, object]:
+    return require_feishu_service().status()
+
+
+@app.post("/admin/directory/feishu/sync", status_code=status.HTTP_202_ACCEPTED)
+def sync_feishu_directory(
+    request: FeishuSyncRequest,
+    background_tasks: BackgroundTasks,
+    _: AuthenticatedUser = Depends(require_admin),
+) -> dict[str, object]:
+    service = require_feishu_service(enabled=True)
+    dispatcher = dispatch_feishu_sync(
+        background_tasks,
+        user_id=request.user_id,
+    )
+    return {
+        "status": "queued",
+        "mode": "user" if request.user_id else "full",
+        "user_id": request.user_id,
+        "dispatcher": dispatcher,
+        "source": service.config.source,
+    }
+
+
+@app.post("/webhooks/feishu", status_code=status.HTTP_202_ACCEPTED)
+async def feishu_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    service = require_feishu_service(enabled=True)
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > 1_048_576:
+        raise HTTPException(status_code=413, detail="Webhook payload too large")
+    raw_body = await request.body()
+    if len(raw_body) > 1_048_576:
+        raise HTTPException(status_code=413, detail="Webhook payload too large")
+    try:
+        payload = service.webhook.decode(raw_body, request.headers)
+    except FeishuWebhookError as error:
+        raise HTTPException(status_code=401, detail="Invalid Feishu webhook") from error
+
+    if payload.get("type") == "url_verification":
+        challenge = str(payload.get("challenge", "")).strip()
+        if not challenge:
+            raise HTTPException(status_code=400, detail="Feishu challenge is missing")
+        return JSONResponse({"challenge": challenge}, status_code=200)
+
+    try:
+        accepted = service.accept_event(payload)
+    except FeishuWebhookError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    dispatcher = None
+    if accepted["status"] == "queued":
+        dispatcher = dispatch_feishu_sync(
+            background_tasks,
+            user_id=accepted.get("user_id"),
+            force_inactive=bool(accepted.get("force_inactive")),
+            event_id=str(accepted["event_id"]),
+        )
+    return {**accepted, "dispatcher": dispatcher}
+
+
 @app.get("/admin/directory/graph")
 def graph_directory_status(
     _: AuthenticatedUser = Depends(require_admin),
@@ -643,6 +720,41 @@ async def microsoft_graph_webhook(
         "lifecycle_notifications": len(lifecycle_notifications),
         "lifecycle_dispatcher": lifecycle_dispatcher,
     }
+
+
+def require_feishu_service(*, enabled: bool = False):
+    if enabled and not feishu_sync_service.config.enabled:
+        raise HTTPException(
+            status_code=503, detail="Feishu directory synchronization is disabled"
+        )
+    return feishu_sync_service
+
+
+def dispatch_feishu_sync(
+    background_tasks: BackgroundTasks,
+    *,
+    user_id: str | None = None,
+    force_inactive: bool = False,
+    event_id: str | None = None,
+) -> str:
+    service = require_feishu_service(enabled=True)
+    if os.getenv("KNOWLEDGE_JOB_MODE", "inline").strip().lower() == "dramatiq":
+        if identity_provisioning_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Dramatiq Feishu synchronization requires PostgreSQL",
+            )
+        from backend.app.jobs.tasks import process_feishu_directory_sync
+
+        process_feishu_directory_sync.send(user_id, force_inactive, event_id)
+        return "dramatiq"
+    background_tasks.add_task(
+        service.sync,
+        user_id,
+        force_inactive=force_inactive,
+        event_id=event_id,
+    )
+    return "background-task"
 
 
 def require_graph_service(*, enabled: bool = False):

@@ -270,6 +270,56 @@ class PostgresIdentityProvisioningStore:
             ).fetchone()
         return bool(row and row["status"] == "queued")
 
+    def record_provider_webhook_event(
+        self,
+        *,
+        provider: str,
+        event_id: str,
+        tenant_id: str | None,
+        resource: str | None,
+        payload: dict[str, Any],
+    ) -> bool:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                INSERT INTO identity_webhook_events (
+                    event_id, provider, tenant_id, resource, client_state_valid,
+                    status, payload_json, received_at
+                ) VALUES (%s, %s, %s, %s, true, 'queued', %s::jsonb, now())
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+                """,
+                (event_id, provider, tenant_id, resource, canonical),
+            ).fetchone()
+        return row is not None
+
+    def mark_provider_webhook_event_processed(
+        self, provider: str, event_id: str
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE identity_webhook_events
+                SET status = 'processed', processed_at = now(), error_message = NULL
+                WHERE provider = %s AND event_id = %s AND status = 'queued'
+                """,
+                (provider, event_id),
+            )
+
+    def provider_webhook_status(self, provider: str) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, count(*) AS count
+                FROM identity_webhook_events
+                WHERE provider = %s
+                GROUP BY status
+                """,
+                (provider,),
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
     def mark_webhook_events_processed(self, resources: set[str]) -> None:
         if not resources:
             return

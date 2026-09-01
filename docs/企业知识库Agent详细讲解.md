@@ -96,7 +96,7 @@ HR 员工小王问同一个年假问题，系统则可以检索 HR 文档、生�
 
 ```text
 文档链路：上传 -> 安全检查 -> 对象存储 -> 解析/OCR -> Chunk -> Embedding -> 索引
-身份链路：Entra/SCIM -> 用户和组同步 -> PostgreSQL 身份目录 -> 当前权限
+身份链路：飞书/Entra/SCIM -> 用户和组织同步 -> PostgreSQL 身份目录 -> 当前权限
 运维链路：Dramatiq -> Redis -> Job/DLQ -> OpenTelemetry -> 备份恢复
 ```
 
@@ -108,7 +108,7 @@ backend/app/retrieval        Embedding、混合检索和重排
 backend/app/security         登录、ACL 和上传安全
 backend/app/agent            Claims、引用绑定和证据验证
 backend/app/research         LangGraph 多轮研究
-backend/app/identity         Entra、Graph 和 SCIM 身份同步
+backend/app/identity         飞书、Entra、Graph 和 SCIM 身份同步
 backend/app/jobs             异步任务、重试和 DLQ
 backend/app/repositories     Memory、SQLite、PostgreSQL 存储
 backend/app/api              FastAPI 接口
@@ -545,7 +545,428 @@ Token 中的部门信息可能过期或由错误配置产生。目录模式使�
 
 长时间研究过程中，系统会在不同阶段刷新 SubjectScope，并在综合答案前重新验证全部证据。用户执行期间被撤权时，旧证据会被删除。
 
-### 12.4 Graph Delta 和 SCIM
+### 12.4 飞书通讯录身份源是怎样实现的
+
+飞书以新增 Provider 的方式接入，并没有删除或改写原有 Entra OIDC、Microsoft Graph 和 SCIM。换句话说，所有 Provider 最后都要生成同一种 `DirectorySyncSnapshot`，再交给同一个身份目录写入器。这样 ACL、认证器和 Research Agent 不需要知道数据来自飞书还是 Entra。
+
+#### 12.4.1 先看文件分工
+
+| 文件 | 职责 |
+|---|---|
+| `backend/app/identity/feishu.py` | 飞书配置、Contact API 客户端、快照转换、Webhook 安全和同步服务 |
+| `backend/app/identity/directory.py` | Provider 无关的用户、部门、角色、成员关系模型，以及 PostgreSQL 写入 |
+| `backend/app/identity/provisioning.py` | Webhook 事件持久化、去重和处理状态 |
+| `backend/app/bootstrap.py` | 把 Feishu Service 与当前身份目录、PostgreSQL Store 组装起来 |
+| `backend/app/api/main.py` | 管理员同步接口、飞书 Webhook 和后台任务分发 |
+| `backend/app/jobs/tasks.py` | Dramatiq 飞书同步 Actor |
+| `scripts/sync_feishu_directory.py` | 运维人员执行首次或定时全量同步的命令 |
+| `tests/unit/test_feishu_identity.py` | 分页、ACL、停用、事件、签名和解密测试 |
+
+完整调用关系如下：
+
+```text
+飞书 Contact API
+  -> FeishuContactClient
+  -> FeishuSnapshotBuilder
+  -> DirectorySyncSnapshot
+  -> PostgresIdentityDirectory.sync()
+  -> directory_users / directory_departments / membership tables
+  -> JWTAuthenticator 根据 issuer + subject 解析当前用户
+  -> SubjectScope
+  -> ACL 过滤、检索和 Agent
+```
+
+#### 12.4.2 配置对象如何工作
+
+`FeishuConfig.from_env()` 只负责把环境变量变成强类型配置。真正调用 API 前执行 `validate_api()`，接收事件前再执行 `validate_webhook()`。这样项目在未启用飞书时仍能正常启动，而真正使用错误配置时会立即失败。
+
+核心配置如下：
+
+```dotenv
+KNOWLEDGE_STORE=postgres
+KNOWLEDGE_IDENTITY_MODE=directory
+KNOWLEDGE_JOB_MODE=dramatiq
+
+KNOWLEDGE_FEISHU_ENABLED=1
+KNOWLEDGE_FEISHU_APP_ID=cli_replace_me
+KNOWLEDGE_FEISHU_APP_SECRET=replace-with-app-secret
+KNOWLEDGE_FEISHU_SOURCE=feishu-contact
+KNOWLEDGE_FEISHU_ISSUER=feishu:cli_replace_me
+KNOWLEDGE_FEISHU_BASE_URL=https://open.feishu.cn
+KNOWLEDGE_FEISHU_ROOT_DEPARTMENT_ID=0
+KNOWLEDGE_FEISHU_VERIFICATION_TOKEN=replace-with-verification-token
+KNOWLEDGE_FEISHU_ENCRYPT_KEY=replace-with-encrypt-key
+KNOWLEDGE_FEISHU_DEPARTMENT_ID_MAP={"od_xxx":"sales"}
+KNOWLEDGE_FEISHU_ADMIN_USER_IDS=ou_admin_xxx
+KNOWLEDGE_FEISHU_WEBHOOK_MAX_AGE_SECONDS=300
+```
+
+几个容易混淆的参数：
+
+- `SOURCE` 是本系统区分同步来源的命名空间。数据库用 `(source, external_id)` 区分不同 Provider 的对象。
+- `ISSUER` 用来与登录 Token 的 `iss` 对齐，不是飞书 API 地址。
+- `ROOT_DEPARTMENT_ID` 默认 `0`，表示从根组织开始同步。
+- `DEPARTMENT_ID_MAP` 把飞书部门 ID 映射为文档 ACL 使用的业务 ID。例如飞书的 `od_xxx` 可以映射为稳定的 `sales`。
+- `ADMIN_USER_IDS` 是显式管理员白名单。只有列出的飞书 `open_id` 会得到内部 `admin` 角色。
+- `ENCRYPT_KEY` 用于事件验签和解密，不能与 Verification Token 混用。
+
+`validate_api()` 还要求 `base_url` 是绝对 HTTPS 地址。请求 URL 生成后会再次比较 scheme 和 host，只允许访问配置的飞书源站，避免路径或配置被利用去请求其他主机。
+
+#### 12.4.3 tenant_access_token 为什么要缓存
+
+Contact API 使用应用身份的 `tenant_access_token`：
+
+```text
+POST /open-apis/auth/v3/tenant_access_token/internal
+body = {app_id, app_secret}
+```
+
+`FeishuContactClient.tenant_access_token()` 将 Token 和到期时间保存在当前进程中。只要还没有进入到期前 60 秒，就复用缓存，不会为每个部门重复申请 Token。
+
+伪代码如下：
+
+```python
+if token_exists and now < expires_at - 60:
+    return cached_token
+
+payload = request_new_token(app_id, app_secret)
+cached_token = payload["tenant_access_token"]
+expires_at = now + payload["expire"]
+return cached_token
+```
+
+普通 API 请求最多尝试 5 次。遇到 `429` 或 `5xx` 时按退避时间重试；遇到 HTTP 401 或飞书已知的 Token 失效错误码时，清空缓存并强制刷新一次。错误响应不是合法 JSON、`code != 0` 或 `data` 不是对象时都会抛出 `FeishuError`，不会把不完整结果继续写入身份目录。
+
+#### 12.4.4 全量同步怎样拉取完整组织
+
+飞书没有在一个响应里直接返回“完整部门树 + 全体用户 + 所有关系”。实现分成两步：
+
+1. `list_departments()` 调用子部门接口，传入 `fetch_child=true`，取得根部门下的全部可见部门。
+2. 对根部门和每一个部门调用 `list_users_by_department()`，取得该部门直属用户。
+
+分页统一由 `_collect_items()` 处理：
+
+```text
+page_token = None
+循环：
+  请求当前页
+  合并 data.items
+  如果 has_more=false：结束
+  否则读取新的 page_token
+```
+
+如果响应说 `has_more=true` 却没有 `page_token`，同步立即失败。循环还设置了 10,000 页的上限，避免异常服务端响应造成无限循环。
+
+同一个员工可能属于多个部门，因此不能把每次查询结果直接追加到数组。`collect_directory()` 使用 `open_id` 作为字典键合并用户，并对 `department_ids` 去重：
+
+```python
+users_by_id[open_id] = merged_user
+merged_user["department_ids"] = unique(all_direct_departments)
+```
+
+最终输出是两个列表：完整部门列表和已经按用户合并的用户列表。
+
+#### 12.4.5 为什么还要转换成 DirectorySyncSnapshot
+
+飞书字段不能直接散落进权限系统。`FeishuSnapshotBuilder` 把飞书对象转换为项目统一模型：
+
+```text
+飞书用户       -> DirectoryUser
+飞书部门       -> DirectoryUnit
+用户属于部门   -> DirectoryMembership
+管理员名单     -> admin role membership
+全部对象       -> DirectorySyncSnapshot
+```
+
+内部 ID 不能依赖显示名称，因为“华东销售部”可以改名。没有显式映射时，代码使用以下稳定规则：
+
+```text
+user_id       = "usr_"  + sha256(source + ":" + open_id)[:24]
+department_id = "dept_" + sha256(source + ":" + open_department_id)[:24]
+```
+
+同一个外部 ID 在同一个 source 下总会生成相同内部 ID。需要让文档 ACL 使用可读业务 ID 时，则通过 `KNOWLEDGE_FEISHU_DEPARTMENT_ID_MAP` 覆盖自动 ID。
+
+用户是否有效由飞书状态字段决定。`active=false`、未激活、离职、冻结或未加入组织都会转换为非活动用户。`IdentityDirectory.resolve_user()` 只返回活动用户，因此员工停用后，即使旧 JWT 还没有过期，也无法继续得到 `SubjectScope`。
+
+#### 12.4.6 祖先链 ACL 是怎样计算的
+
+假设飞书部门树是：
+
+```text
+销售部 od_sales -> 内部 ID sales
+  华东区 od_east -> 内部 ID dept_A
+    杭州组 od_hangzhou -> 内部 ID dept_B
+```
+
+Alice 的直属部门只有 `od_hangzhou`，文档 ACL 却可能写成：
+
+```python
+ACLEntry(SubjectType.DEPARTMENT, "sales")
+```
+
+如果只保存直属部门，Alice 会被错误拒绝。Builder 先建立两个索引：
+
+```text
+parent_by_external[od_hangzhou] = od_east
+unit_id_by_external[od_sales] = sales
+```
+
+然后从每个直属部门一直向父级回溯：
+
+```python
+current = direct_department
+while current in known_departments:
+    accessible_departments.add(current)
+    current = parent_by_external[current]
+```
+
+因此 Alice 最终拥有三个部门成员关系：杭州组、华东区、销售部。ACL 检查只需要判断文档的 `subject_id` 是否出现在 `SubjectScope.department_ids` 中，不必在每次检索时重新遍历部门树。
+
+回溯时维护 `seen` 集合。如果再次遇到同一部门，就说明飞书数据或映射形成了环，例如 A 的父级是 B、B 的父级又是 A，此时同步会失败而不是生成错误权限。无部门用户的集合保持为空，不会继承根部门权限。
+
+#### 12.4.7 PostgreSQL 写入与“停用缺失用户”
+
+全量同步构造快照时使用：
+
+```python
+deactivate_missing=True
+```
+
+这表示同一 `source` 下，本次完整快照没有出现的旧用户和部门应被标记为 inactive。随后在一个数据库事务中执行：
+
+```text
+停用快照中缺失的旧对象
+UPSERT 当前用户
+UPSERT 当前部门和角色
+删除这些用户的旧成员关系
+插入新的部门和角色成员关系
+写入 directory_sync_runs
+提交事务
+```
+
+关键表包括：
+
+| 表 | 内容 |
+|---|---|
+| `directory_users` | 内部用户、source、外部 ID、issuer、subject、active |
+| `directory_departments` | 内部部门、飞书部门 ID、名称、active |
+| `directory_user_departments` | 用户经过祖先链展开后的部门成员关系 |
+| `directory_roles` / `directory_user_roles` | 管理员等角色 |
+| `directory_sync_runs` | 每次同步数量和完成时间 |
+
+单用户增量同步则使用 `deactivate_missing=False`。它只替换目标用户的资料和成员关系，不会因为快照里只有一个人就误停用其他员工。这是全量和增量不能共用同一个停用策略的原因。
+
+#### 12.4.8 一条飞书事件如何变成同步任务
+
+除了命令行脚本，管理员还可以通过 API 触发同步。全量同步请求体为空对象：
+
+```http
+POST /admin/directory/feishu/sync
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{}
+```
+
+单用户同步则传入飞书 `open_id`：
+
+```json
+{"user_id":"ou_xxx"}
+```
+
+路由先通过 `require_admin` 验证管理员，再由 `dispatch_feishu_sync()` 根据 `KNOWLEDGE_JOB_MODE` 选择 FastAPI BackgroundTasks 或 Dramatiq。响应只表示任务已经排队，不表示目录已经同步完成：
+
+```json
+{
+  "status": "queued",
+  "mode": "full",
+  "dispatcher": "dramatiq",
+  "source": "feishu-contact"
+}
+```
+
+公网入口是：
+
+```text
+POST /webhooks/feishu
+```
+
+普通事件的完整时序是：
+
+```text
+飞书发送事件
+  -> Nginx 只允许 POST，并限制 1 MB
+  -> FastAPI 再次检查 Content-Length 和实际 body
+  -> FeishuWebhookCodec 验证、解密并解析 JSON
+  -> FeishuSyncService.accept_event() 检查事件类型和 event_id
+  -> identity_webhook_events 使用 event_id 去重
+  -> Dramatiq 将同步消息放入 identity-sync 队列
+  -> Worker 创建自己的 FeishuSyncService
+  -> 执行单用户同步或全量同步
+  -> 成功后把事件状态从 queued 更新为 processed
+```
+
+事件路由规则如下：
+
+| 事件 | 动作 | 原因 |
+|---|---|---|
+| `contact.user.created_v3` | 根据 `open_id` 拉取单个用户 | 新用户不会影响其他人 |
+| `contact.user.updated_v3` | 根据 `open_id` 刷新用户和部门关系 | 调岗可以定向处理 |
+| `contact.user.deleted_v3` | 直接写入 inactive，不再读取已删除用户 | 删除后详情接口可能已经不可用 |
+| `contact.department.*_v3` | 全量同步 | 部门父子关系变化会影响整棵子树的祖先链 |
+| `contact.scope.updated_v3` | 全量同步 | 应用可见范围变化可能同时影响许多对象 |
+| 其他事件 | 返回 ignored | 不让无关事件触发目录同步 |
+
+事件中的用户 ID 有时是字符串，有时是包含 `open_id`、`user_id` 和 `union_id` 的对象。`feishu_event_user_id()` 会递归解析，并优先选择 `open_id`。
+
+开发环境的 `inline` 模式使用 FastAPI `BackgroundTasks`。生产设置为 `dramatiq` 后，API 只入队并快速返回。代码明确要求 Dramatiq 飞书同步必须使用 PostgreSQL，因为 Worker 自己进程里的内存目录无法被 API 进程共享。
+
+#### 12.4.9 Webhook 验证和 AES 解密细节
+
+飞书第一次配置回调地址时会发送 `url_verification`。接口验证 Token 后返回：
+
+```json
+{"challenge":"飞书发来的 challenge"}
+```
+
+这一响应必须是 HTTP 200；普通事件接收成功使用 HTTP 202。
+
+启用 Encrypt Key 后，外层请求通常是：
+
+```json
+{"encrypt":"Base64 编码的密文"}
+```
+
+处理顺序为：
+
+1. 读取 `X-Lark-Request-Timestamp`、`X-Lark-Request-Nonce` 和 `X-Lark-Signature`。
+2. 检查时间戳与服务器当前时间的差值不超过配置窗口，默认 300 秒。
+3. 按字节拼接 `timestamp + nonce + encrypt_key + raw_body`。
+4. 对拼接结果计算 SHA-256，并使用常量时间比较验证签名。
+5. Base64 解码 `encrypt`。
+6. 对 Encrypt Key 计算 SHA-256，得到 32 字节 AES key。
+7. 取密文前 16 字节作为 IV，以 AES-256-CBC 解密剩余内容。
+8. 验证并移除 PKCS#7 Padding，再解析内部 JSON。
+9. 使用 `hmac.compare_digest` 比较内部 Verification Token。
+
+公式可以写成：
+
+```text
+signature = hex(sha256(timestamp || nonce || encrypt_key || raw_body))
+aes_key   = sha256(encrypt_key)
+iv        = base64_decode(encrypt)[0:16]
+plaintext = PKCS7_unpad(AES_CBC_decrypt(aes_key, iv, ciphertext))
+```
+
+这里的 `||` 表示字节拼接，不是字符串中间加分隔符。解密、Padding、JSON、Token、签名或时间窗口任一检查失败，接口都返回统一的无敏感细节错误，不回显密钥或原始异常。
+
+时间窗口防止旧请求长期重放，`event_id` 唯一约束防止有效窗口内的同一业务事件重复执行。两层保护解决的是不同问题，不能只保留其中一个。
+
+#### 12.4.10 为什么事件要先持久化再入队
+
+`PostgresIdentityProvisioningStore.record_provider_webhook_event()` 使用：
+
+```sql
+INSERT INTO identity_webhook_events (...)
+VALUES (..., 'queued', ...)
+ON CONFLICT (event_id) DO NOTHING
+RETURNING event_id;
+```
+
+只有真正插入成功的事件才会进入队列。重复 `event_id` 返回 `duplicate`，不会再次派发。Worker 完成同步后再执行：
+
+```sql
+UPDATE identity_webhook_events
+SET status = 'processed', processed_at = now()
+WHERE provider = %s AND event_id = %s AND status = 'queued';
+```
+
+Dramatiq Actor 设置了最多 5 次重试、10 秒起始退避、5 分钟最大退避和 30 分钟执行上限。即使增量事件最终失败，定时全量同步仍会校准目录，因此生产环境必须同时保留“事件增量 + 定时全量”两条链路。
+
+#### 12.4.11 飞书通讯录与登录身份怎样对齐
+
+飞书通讯录解决“组织中有哪些人、属于哪些部门”，它不会自动替换浏览器 OIDC 登录。认证器仍然先验证 JWT，再使用：
+
+```python
+identity_directory.resolve_user(
+    issuer=verified_token.issuer,
+    subject=verified_token.subject,
+)
+```
+
+当前飞书同步默认把 `open_id` 作为 subject。因此有两种可行方案：
+
+1. 自建登录服务完成飞书登录后签发本系统 JWT，把 `sub` 设为该应用下的飞书 `open_id`，并使 Token `iss` 与 `KNOWLEDGE_FEISHU_ISSUER` 完全一致。
+2. 继续使用 Entra 或其他 OIDC 时，建立经过验证的跨系统账号映射，再把稳定映射结果写入目录。
+
+不能直接假定 Entra `oid`、OIDC `sub`、飞书 `open_id` 和邮箱是同一个标识。尤其不要在没有账号绑定流程的情况下仅凭同名或相似邮箱自动合并账号，否则可能把一个人的部门权限授给另一个人。
+
+#### 12.4.12 从零完成一次联调
+
+第一步，在飞书开发者后台创建企业自建应用，开通应用身份读取用户和部门所需的 Contact 权限，并配置应用可用范围。随后订阅：
+
+```text
+contact.user.created_v3
+contact.user.updated_v3
+contact.user.deleted_v3
+contact.department.created_v3
+contact.department.updated_v3
+contact.department.deleted_v3
+contact.scope.updated_v3
+```
+
+第二步，把真实参数写入本地 `.env.knowledge`，不要修改或提交 `.env.example` 中的占位符。
+
+第三步，确认数据库迁移、API 和 Worker：
+
+```powershell
+D:\Anaconda\envs\enterprise-kb-agent\python.exe -m alembic -c alembic.ini upgrade head
+D:\Anaconda\envs\enterprise-kb-agent\python.exe -m dramatiq backend.app.jobs.tasks --processes 1 --threads 2
+D:\Anaconda\envs\enterprise-kb-agent\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8010
+```
+
+第四步，执行首次全量同步：
+
+```powershell
+D:\Anaconda\envs\enterprise-kb-agent\python.exe scripts/sync_feishu_directory.py
+```
+
+只调试一个用户时可以使用：
+
+```powershell
+D:\Anaconda\envs\enterprise-kb-agent\python.exe scripts/sync_feishu_directory.py --user-id ou_xxx
+```
+
+第五步，使用管理员 Token 查看状态：
+
+```text
+GET /admin/directory/feishu
+```
+
+重点观察 `enabled`、`app_id_configured`、`webhook_configured`、`encrypted_webhook`、目录数量和 `webhook_events` 状态计数。
+
+第六步，域名备案和 HTTPS 生效后，将飞书回调地址配置为：
+
+```text
+https://wodeff.cn/webhooks/feishu
+```
+
+仓库中的 Nginx 配置只开放该精确 POST 路径，并把请求转发到知识库 API。反向代理必须保留三个 `X-Lark-*` 请求头，否则签名验证会失败。
+
+第七步，运行回归验证：
+
+```powershell
+D:\Anaconda\envs\enterprise-kb-agent\python.exe -m unittest tests.unit.test_feishu_identity -v
+D:\Anaconda\envs\enterprise-kb-agent\python.exe -m unittest discover -s tests -p "test_*.py"
+D:\Anaconda\envs\enterprise-kb-agent\python.exe scripts/run_security_eval.py
+```
+
+飞书专用测试覆盖：分页与 Token 缓存、多部门合并、祖先链 ACL、无部门边界、管理员映射、部门环检测、单用户同步不误停用其他人、离职停用、事件去重、嵌套用户 ID、Verification Token、签名、过期请求和 AES 解密。
+
+相关官方资料：[自建应用 tenant_access_token](https://open.feishu.cn/document/server-docs/authentication-management/access-token/tenant_access_token_internal)、[获取子部门列表](https://open.feishu.cn/document/server-docs/contact-v3/department/children)、[获取部门直属用户](https://open.feishu.cn/document/server-docs/contact-v3/user/find_by_department)、[事件回调地址配置](https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case)、[官方 Python SDK 事件处理](https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/event/dispatcher_handler.py)。
+
+### 12.5 Graph Delta 和 SCIM
 
 Microsoft Graph Delta 用于增量同步 Entra 用户和用户组。只有整组分页数据成功应用后，最终 `@odata.deltaLink` 才会保存，避免部分同步造成身份目录不一致。
 
@@ -553,17 +974,19 @@ Graph webhook 使用 `clientState` 校验通知，保存事件实现去重，再
 
 SCIM 2.0 提供标准 `/Users` 和 `/Groups` CRUD/PATCH 接口，供支持 SCIM 的身份提供商主动推送组织变化。
 
-Graph Delta 与 SCIM 的区别可以这样理解：
+三类同步方式可以这样理解：
 
 | 方式 | 谁主动 | 适用场景 |
 |---|---|---|
+| 飞书全量同步 | 本系统分页拉取飞书通讯录 | 国内企业以飞书作为组织身份源 |
+| 飞书事件 Webhook | 飞书通知后按用户刷新或全量校准 | 快速响应入职、调岗和离职 |
 | Graph Delta | 本系统定期向 Microsoft Graph 拉取变化 | 深度使用 Microsoft Entra |
 | Graph Webhook | Microsoft Graph 通知本系统发生变化 | 希望更快触发增量同步 |
 | SCIM 2.0 | 身份提供商主动调用本系统接口 | 对接多种支持 SCIM 的 IdP |
 
 Graph Subscription 有有效期，不能创建一次就永久使用。维护任务会在到期前续期，发现订阅不存在时重新创建，并处理 `missed` 和 `subscriptionRemoved` 生命周期事件。Webhook 只负责安全接收和排队，不在 HTTP 回调中直接执行完整目录同步。
 
-当前 Graph webhook 的代码和本地验证已完成，正式公网部署仍依赖域名备案、HTTPS、Entra 应用权限和生产密钥配置。
+当前飞书与 Graph webhook 的代码和本地验证已完成，正式公网部署仍依赖域名备案、HTTPS、对应平台的应用权限和生产密钥配置。
 
 ## 13. 异步任务和可靠性
 
@@ -840,7 +1263,7 @@ Invoke-RestMethod `
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-当前基线为 65 项 Python 测试通过。
+当前基线为 80 项 Python 测试通过，其中 15 项专门覆盖飞书分页、Token 缓存、祖先部门 ACL、增量同步、离职停用、事件去重、Verification Token、验签、重放窗口和 AES 解密。
 
 运行前端 OIDC 测试：
 
@@ -901,7 +1324,11 @@ Citation Binder 或 Verifier 返回了什么 issue
 
 检查 `clientState`、事件是否被去重、Dramatiq 同步任务是否入队、Graph 应用权限是否完成管理员同意，以及最终 `deltaLink` 是否更新。Webhook 返回 202 只说明通知已接收，不代表增量同步已经完成。
 
-### 18.7 没有 Trace 或成本指标
+### 18.7 飞书 webhook 收到事件但权限没有变化
+
+先调用 `GET /admin/directory/feishu` 查看启用状态和事件计数，再检查 App ID/Secret、通讯录权限与应用可用范围。签名失败时核对 Verification Token、Encrypt Key 和代理是否原样转发了三个 `X-Lark-*` 请求头；同步成功但登录仍然 401 时，重点核对 Token 与目录中的 `issuer + subject` 是否完全相同。部门 ACL 不一致时，检查 `KNOWLEDGE_FEISHU_DEPARTMENT_ID_MAP` 是否使用飞书 `open_department_id`。
+
+### 18.8 没有 Trace 或成本指标
 
 检查 `KNOWLEDGE_OTEL_ENABLED=1`、Exporter 是否为 `otlp`、Collector 地址是否可达，以及价格环境变量是否配置。价格为 0 时仍可以看到 Token，成本会显示为 0。
 
@@ -935,9 +1362,10 @@ GET  /admin/jobs/dead-letter
 13. `backend/app/research/service.py`：理解 Research Job、权限刷新和 Checkpoint。
 14. `backend/app/jobs/service.py`、`tasks.py` 与 `dlq.py`：理解异步执行和失败处理。
 15. `backend/app/security/auth.py`：理解 JWT/OIDC 和服务端身份解析。
-16. `backend/app/identity/microsoft_graph.py` 与 `scim_api.py`：理解组织同步。
-17. `backend/app/observability.py`：理解 Trace、Token、成本和延迟指标。
-18. `backend/app/api/main.py`：最后看 API 如何把所有组件连接起来。
+16. `backend/app/identity/feishu.py`：理解飞书通讯录、祖先链 ACL 与安全回调。
+17. `backend/app/identity/microsoft_graph.py` 与 `scim_api.py`：理解其他组织同步方式。
+18. `backend/app/observability.py`：理解 Trace、Token、成本和延迟指标。
+19. `backend/app/api/main.py`：最后看 API 如何把所有组件连接起来。
 
 每读完一个文件，都尝试回答三个问题：它接收什么数据、保证什么不变量、失败时由谁处理。这样比逐行背代码更容易形成系统思维。
 
@@ -947,6 +1375,8 @@ GET  /admin/jobs/dead-letter
 
 - 使用 OIDC，关闭 `/auth/dev-token`，启用服务端目录模式。
 - 所有密钥来自安全配置，不写入仓库、镜像或前端 Bundle。
+- 飞书身份源完成应用发布、通讯录权限审批、可用范围配置，并验证首次全量同步。
+- 飞书 webhook 使用稳定公网 HTTPS 地址，配置 Encrypt Key，并定时运行全量同步兜底。
 - Graph webhook 使用稳定公网 HTTPS 域名，并完成 DNS、证书、备案和反向代理配置。
 - 周期运行 Subscription Reconcile，验证续期、删除和 missed 事件恢复。
 - 配置外部病毒扫描器，并让严格安全评测通过。
@@ -957,7 +1387,7 @@ GET  /admin/jobs/dead-letter
 - 配置 OTLP Collector、告警阈值、Token 价格和日志保留策略。
 - 扩大真实企业评测集，覆盖权限变化、旧版本、冲突资料和长任务撤权。
 
-当前项目的核心代码、65 项 Python 测试、5 项 OIDC 前端测试和 19 项非严格安全评测已经完成。外部病毒扫描器尚未配置为严格门禁；正式 Microsoft Graph webhook 公网部署仍等待域名备案与生产云配置。这些必须如实描述为“待完成”，不能说成已经生产上线。
+当前项目的核心代码、80 项 Python 测试、5 项 OIDC 前端测试和 19 项非严格安全评测已经完成。外部病毒扫描器尚未配置为严格门禁；正式飞书和 Microsoft Graph webhook 公网部署仍等待域名备案、平台权限审批与生产密钥配置。这些必须如实描述为“待完成”，不能说成已经生产上线。
 
 ## 21. 常见误区
 
@@ -998,10 +1428,13 @@ Broker 不是业务事实来源。任务状态、尝试次数和 DLQ 必须持�
 9. 开启 OpenTelemetry，比较检索、重排和 LLM 阶段延迟。
 10. 修改 Embedding 维度，执行受控向量迁移并重新索引。
 11. 停用身份目录中的用户，验证未过期 Token 也不能继续读取资料。
-12. 为安全评测增加跨部门、过期版本、撤权中任务和 Graph 重复通知案例。
+12. 构造“销售部 -> 华东区 -> 杭州组”，验证杭州组用户可以读取授权给销售部的文档。
+13. 连续发送两次相同飞书 `event_id`，验证第二次返回 duplicate 且不会再次入队。
+14. 模拟 `contact.user.deleted_v3`，验证旧 JWT 仍有效但用户立即无法解析。
+15. 为安全评测增加跨部门、过期版本、撤权中任务、飞书重复事件和 Graph 重复通知案例。
 
 ## 23. 最后用一段话总结整个项目
 
-这是一个以企业权限和证据可信度为核心的 Research Agent。文档经过安全检查、对象存储、Docling/OCR 解析、Chunk 切分和 Embedding 后写入 PostgreSQL/pgvector；用户通过本地 JWT 或 Entra OIDC 完成身份认证，服务端身份目录提供当前部门和角色；系统在 ACL 过滤后执行全文与向量混合检索，再通过 Reranker 排序；复杂问题由 LangGraph 按 `plan -> retrieve -> assess -> expand/retrieve -> synthesize` 多轮研究；最终答案必须经过 Claim 结构化、Citation Binder 引用绑定和 Evidence Verifier 证据验证；耗时工作通过 Dramatiq 和 Redis 异步执行，状态与 DLQ 持久化到 PostgreSQL，并使用 Alembic、连接池、备份恢复和 OpenTelemetry 保证工程可靠性。
+这是一个以企业权限和证据可信度为核心的 Research Agent。文档经过安全检查、对象存储、Docling/OCR 解析、Chunk 切分和 Embedding 后写入 PostgreSQL/pgvector；用户通过本地 JWT 或 Entra OIDC 完成身份认证，飞书、Microsoft Graph 或 SCIM 将当前用户、部门和角色同步到服务端身份目录；系统在 ACL 过滤后执行全文与向量混合检索，再通过 Reranker 排序；复杂问题由 LangGraph 按 `plan -> retrieve -> assess -> expand/retrieve -> synthesize` 多轮研究；最终答案必须经过 Claim 结构化、Citation Binder 引用绑定和 Evidence Verifier 证据验证；耗时工作通过 Dramatiq 和 Redis 异步执行，状态与 DLQ 持久化到 PostgreSQL，并使用 Alembic、连接池、备份恢复和 OpenTelemetry 保证工程可靠性。
 
 理解这条主线后，再学习每个框架的 API 会容易很多。框架只是实现手段，真正重要的是：系统为什么需要这个步骤，以及不做这个步骤会出现什么风险。
